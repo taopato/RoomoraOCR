@@ -483,6 +483,10 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         if re.search(r"\bADE[TL]X?\b|\bADET\b", upper_name):
             continue
+        if re.fullmatch(r"(?:\d+[.,]?\d*\s*)?(?:KGX|[I1]1/KG|X\d+|TL/KG)", upper_name):
+            continue
+        if re.fullmatch(r"[A-Z0-9./-]{1,6}", upper_name):
+            continue
         key = (upper_name, float(item["line_total"]))
         if key in seen:
             continue
