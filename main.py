@@ -356,13 +356,20 @@ def try_extract_date(lines: list[dict[str, Any]]) -> str | None:
     for line in lines:
         for match in DATE_PATTERN.finditer(line["text"]):
             candidate = match.group(1)
-            for pattern in ("%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"):
-                try:
-                    parsed = datetime.strptime(candidate, pattern).date()
-                    if 2018 <= parsed.year <= datetime.utcnow().year + 1:
-                        return parsed.isoformat()
-                except ValueError:
-                    continue
+            candidates = [candidate]
+            tail = re.split(r"[./-]", candidate)[-1]
+            if len(tail) == 4:
+                shortened = candidate[:-2]
+                candidates.append(shortened)
+
+            for current in candidates:
+                for pattern in ("%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"):
+                    try:
+                        parsed = datetime.strptime(current, pattern).date()
+                        if 2018 <= parsed.year <= datetime.utcnow().year + 1:
+                            return parsed.isoformat()
+                    except ValueError:
+                        continue
     return None
 
 
