@@ -14,7 +14,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CACHE_DIR = BASE_DIR / ".cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Receipt OCR Service", version="2.0.0")
+app = FastAPI(title="Receipt OCR Service", version="2.1.0")
 ocr_engine: RapidOCR | None = None
 
 IGNORE_KEYWORDS = [
@@ -35,7 +35,7 @@ IGNORE_KEYWORDS = [
     "HESAP ADI",
     "HESAP KODU",
     "BAKIYE",
-    "NİHAI",
+    "NÄ°HAI",
     "NIHAI",
     "ODENECEK",
     "TUTAR",
@@ -44,6 +44,44 @@ IGNORE_KEYWORDS = [
 ]
 
 DECIMAL_AMOUNT_PATTERN = re.compile(r"\d{1,3}(?:[ .]\d{3})*(?:[.,]\d{2})")
+LETTER_PATTERN = re.compile(r"[A-ZÇĞİÖŞÜa-zçğıöşü]")
+DATE_PATTERN = re.compile(r"(\d{2}[./-]\d{2}[./-]\d{2,4})")
+MEASUREMENT_UNITS = ("L", "LT", "ML", "GR", "G", "KG", "CL")
+STORE_BLACKLIST = {
+    "TARIH",
+    "SAAT",
+    "FIS",
+    "FIŞ",
+    "NO",
+    "KREDI",
+    "KREDİ",
+    "KARTI",
+    "HALKBANK",
+    "ODEME",
+    "ÖDEME",
+    "POS",
+    "TOPLAM",
+    "KDV",
+}
+MONTH_HINTS = {
+    "OCAK",
+    "SUBAT",
+    "ŞUBAT",
+    "MART",
+    "NISAN",
+    "NİSAN",
+    "MAYIS",
+    "HAZIRAN",
+    "TEMMUZ",
+    "AGUSTOS",
+    "AĞUSTOS",
+    "EYLUL",
+    "EYLÜL",
+    "EKIM",
+    "EKİM",
+    "KASIM",
+    "ARALIK",
+}
 
 
 def get_ocr() -> RapidOCR:
@@ -54,7 +92,13 @@ def get_ocr() -> RapidOCR:
 
 
 def normalize_text(value: str) -> str:
-    return re.sub(r"\s+", " ", (value or "").strip())
+    cleaned = (
+        (value or "")
+        .replace("ï¿¥", " ")
+        .replace("¥", " ")
+        .replace("â‚º", " ")
+    )
+    return re.sub(r"\s+", " ", cleaned.strip())
 
 
 def parse_amount(raw: str) -> float | None:
@@ -86,11 +130,15 @@ def amount_from_text(text: str) -> float | None:
 
 def amount_only(text: str) -> float | None:
     normalized = normalize_text(text)
-    cleaned = normalized.replace("₺", "").replace("TL", "").strip()
+    cleaned = normalized.replace("TL", "").strip()
     cleaned = re.sub(r"^[*xX+\-]+", "", cleaned).strip()
     if re.fullmatch(DECIMAL_AMOUNT_PATTERN.pattern, cleaned):
         return parse_amount(cleaned)
     return None
+
+
+def has_letters(text: str) -> bool:
+    return bool(LETTER_PATTERN.search(normalize_text(text)))
 
 
 def is_code_or_meta(text: str) -> bool:
@@ -98,6 +146,8 @@ def is_code_or_meta(text: str) -> bool:
     if not upper:
         return True
     if any(keyword in upper for keyword in IGNORE_KEYWORDS):
+        return True
+    if any(keyword in upper for keyword in ["KART", "POS", "TEKPOS", "BANK", "VISA", "MASTER", "MASTERCARD"]):
         return True
     if re.fullmatch(r"\d{6,}", upper):
         return True
@@ -110,7 +160,7 @@ def is_code_or_meta(text: str) -> bool:
 
 def is_product_name(text: str) -> bool:
     upper = normalize_text(text).upper()
-    if not re.search(r"[A-ZÇĞİÖŞÜ]", upper):
+    if not has_letters(upper):
         return False
     if re.search(r"\bADE[TL]X?\b|\bADET\b", upper):
         return False
@@ -125,7 +175,68 @@ def normalize_product_candidate(text: str) -> str:
     value = re.sub(r"%\s*\d+[.,]?\d*", "", value)
     value = re.sub(r"\bADET\b", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\bX\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"[*xX]?\s*\d{1,4}(?:[.,]\d{2})?$", "", value)
+    value = re.sub(r"\b\d{1,2}[.,]\d{1,2}\s*(?:L|LT|ML|GR|G|KG|CL)\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\b\d+\s*(?:L|LT|ML|GR|G|KG|CL)\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s{2,}", " ", value)
     return normalize_text(value)
+
+
+def product_candidate_score(candidate: str) -> int:
+    value = normalize_product_candidate(candidate)
+    if not value or is_code_or_meta(value) or not has_letters(value):
+        return -100
+
+    letters = len(re.findall(r"[A-ZÇĞİÖŞÜa-zçğıöşü]", value))
+    digits = len(re.findall(r"\d", value))
+    words = len(value.split())
+    score = min(letters, 24) + min(words * 3, 18) - min(digits * 2, 12)
+
+    upper = value.upper()
+    if re.search(r"[*%]", upper):
+        score -= 8
+    if any(keyword in upper for keyword in STORE_BLACKLIST):
+        score -= 20
+    if len(value) < 3:
+        score -= 20
+
+    return score
+
+
+def store_line_score(text: str) -> int:
+    value = normalize_text(text)
+    upper = value.upper()
+    if not value or is_code_or_meta(value) or amount_only(value):
+        return -100
+    if DATE_PATTERN.search(value):
+        return -100
+    if ":" in value:
+        return -60
+    if sum(ch.isdigit() for ch in value) >= max(2, len(value) // 4):
+        return -50
+    if any(token in upper for token in STORE_BLACKLIST):
+        return -80
+
+    score = len(re.findall(r"[A-ZÇĞİÖŞÜa-zçğıöşü]", value))
+    score -= len(re.findall(r"\d", value)) * 2
+    score -= abs(len(value.split()) - 2) * 2
+
+    if any(month in upper for month in MONTH_HINTS):
+        score -= 12
+    if re.fullmatch(r"[A-Za-zÇĞİÖŞÜçğıöşü]+\s+\d{4}", value):
+        score -= 24
+    return score
+
+
+def looks_like_measurement_amount(text: str, match: re.Match[str]) -> bool:
+    normalized = normalize_text(text)
+    right = normalized[match.end():match.end() + 3].upper()
+    left = normalized[max(0, match.start() - 2):match.start()].upper()
+    if any(right.startswith(unit) for unit in MEASUREMENT_UNITS):
+        return True
+    if left.endswith("/") and right[:1] in {"G", "K", "L", "M", "C"}:
+        return True
+    return False
 
 
 def extract_segmented_items(entry: dict[str, Any]) -> list[dict[str, Any]]:
@@ -147,9 +258,8 @@ def extract_segmented_items(entry: dict[str, Any]) -> list[dict[str, Any]]:
         segment_start = previous_end
         segment_end = match.end()
         previous_end = match.end()
-        if not candidate or is_code_or_meta(candidate):
-            continue
-        if not re.search(r"[A-ZÃ‡ÄÄ°Ã–ÅÃœa-zÃ§ÄŸÄ±Ã¶ÅŸÃ¼]", candidate):
+
+        if product_candidate_score(candidate) < 4:
             continue
 
         left_ratio = max(0.0, min(1.0, segment_start / total_length))
@@ -219,7 +329,7 @@ def split_mixed_lines(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         amount_text = match.group("amount")
         rest_text = normalize_text(match.group("rest"))
-        if not rest_text or not (rest_text[0].isdigit() or rest_text.startswith("(") or rest_text.startswith("（")):
+        if not rest_text or not (rest_text[0].isdigit() or rest_text.startswith("(") or rest_text.startswith("ï¼ˆ")):
             split_entries.append(entry)
             continue
 
@@ -244,14 +354,15 @@ def split_mixed_lines(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def try_extract_date(lines: list[dict[str, Any]]) -> str | None:
     for line in lines:
-        match = re.search(r"(\d{2}[./-]\d{2}[./-]\d{2,4})", line["text"])
-        if not match:
-            continue
-        for pattern in ("%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"):
-            try:
-                return datetime.strptime(match.group(1), pattern).date().isoformat()
-            except ValueError:
-                continue
+        for match in DATE_PATTERN.finditer(line["text"]):
+            candidate = match.group(1)
+            for pattern in ("%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"):
+                try:
+                    parsed = datetime.strptime(candidate, pattern).date()
+                    if 2018 <= parsed.year <= datetime.utcnow().year + 1:
+                        return parsed.isoformat()
+                except ValueError:
+                    continue
     return None
 
 
@@ -280,7 +391,13 @@ def extract_inline_item(text: str) -> tuple[str, float] | None:
     if not matches:
         return None
 
+    best_item: tuple[str, float] | None = None
+    best_score = -1000
+
     for match in reversed(matches):
+        if looks_like_measurement_amount(normalized, match):
+            continue
+
         amount = parse_amount(match.group(0))
         if amount is None or amount <= 0:
             continue
@@ -288,19 +405,17 @@ def extract_inline_item(text: str) -> tuple[str, float] | None:
         before = normalize_product_candidate(normalized[:match.start()])
         after = normalize_product_candidate(normalized[match.end():])
 
-        candidates = [after, before]
-        for candidate in candidates:
+        for candidate in (after, before):
             if not candidate:
                 continue
-            if not re.search(r"[A-ZÇĞİÖŞÜa-zçğıöşü]", candidate):
-                continue
-            if re.search(r"\bADE[TL]X?\b|\bADET\b", candidate.upper()):
-                continue
-            if is_code_or_meta(candidate):
-                continue
-            return candidate, amount
+            score = product_candidate_score(candidate)
+            if amount > 5000:
+                score -= 50
+            if score > best_score:
+                best_score = score
+                best_item = (candidate, amount)
 
-    return None
+    return best_item if best_score >= 4 else None
 
 
 def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -342,28 +457,33 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
             next_line = lines[index + 1]
             next_amount = amount_only(next_line["text"])
             if next_amount and next_amount > 0:
-                items.append({
-                    "name": normalize_product_candidate(text),
-                    "price": next_amount,
-                    "quantity": 1,
-                    "line_total": next_amount,
-                    "box_left": next_line["left"],
-                    "box_top": next_line["top"],
-                    "box_width": next_line["width"],
-                    "box_height": next_line["height"],
-                })
-                index += 2
-                continue
+                candidate = normalize_product_candidate(text)
+                if product_candidate_score(candidate) >= 4:
+                    items.append({
+                        "name": candidate,
+                        "price": next_amount,
+                        "quantity": 1,
+                        "line_total": next_amount,
+                        "box_left": next_line["left"],
+                        "box_top": next_line["top"],
+                        "box_width": next_line["width"],
+                        "box_height": next_line["height"],
+                    })
+                    index += 2
+                    continue
 
         index += 1
 
     deduped: list[dict[str, Any]] = []
     seen: set[tuple[str, float]] = set()
     for item in items:
+        item["name"] = normalize_product_candidate(item["name"])
         upper_name = item["name"].upper()
+        if product_candidate_score(item["name"]) < 4:
+            continue
         if re.search(r"\bADE[TL]X?\b|\bADET\b", upper_name):
             continue
-        key = (item["name"].upper(), float(item["line_total"]))
+        key = (upper_name, float(item["line_total"]))
         if key in seen:
             continue
         seen.add(key)
@@ -418,18 +538,14 @@ def run_ocr(image_bytes: bytes) -> dict[str, Any]:
             "box_height": 32,
         }]
 
-    store_name = next(
-        (
-            line["text"]
-            for line in lines[:8]
-            if not is_code_or_meta(line["text"])
-            and not amount_only(line["text"])
-            and not re.search(r"\d{2}[./-]\d{2}[./-]\d{2,4}", line["text"])
-            and ":" not in line["text"]
-            and all(keyword not in line["text"].upper() for keyword in ["SATIS", "KASIYER", "TARIH", "SAAT", "NO"])
-        ),
-        None,
-    )
+    max_store_top = max(80, int(image.shape[0] * 0.22))
+    store_candidates = [
+        line["text"]
+        for line in lines[:8]
+        if line["top"] <= max_store_top and store_line_score(line["text"]) >= 8
+    ]
+    store_name = store_candidates[0] if store_candidates else None
+
     return {
         "raw_text": raw_text,
         "store_name": store_name,
