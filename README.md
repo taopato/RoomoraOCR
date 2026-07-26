@@ -1,4 +1,4 @@
-# Receipt OCR Service
+# Roomora OCR Service
 
 Bu servis ücretsiz `PaddleOCR` kullanarak fiş fotoğrafından:
 
