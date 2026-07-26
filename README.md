@@ -1,5 +1,12 @@
 # Roomora OCR Service
 
+## Docker
+
+```bash
+docker build -t roomora-ocr .
+docker run --rm -p 8008:8008 roomora-ocr
+```
+
 Bu servis ücretsiz `PaddleOCR` kullanarak fiş fotoğrafından:
 
 - ham metin
