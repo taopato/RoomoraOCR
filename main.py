@@ -855,7 +855,10 @@ def run_ocr(image_bytes: bytes) -> dict[str, Any]:
     image_array = np.frombuffer(image_bytes, dtype=np.uint8)
     image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
     if image is None:
-        return {"raw_text": "", "store_name": None, "receipt_date": None, "total_amount": None, "items": []}
+        return {
+            "raw_text": "", "store_name": None, "receipt_date": None,
+            "total_amount": None, "image_width": None, "image_height": None, "items": [],
+        }
 
     def to_entries(output: Any) -> list[list[Any]]:
         boxes = output.boxes if output.boxes is not None else []
@@ -894,7 +897,11 @@ def run_ocr(image_bytes: bytes) -> dict[str, Any]:
         metadata_result = result
 
     if not result:
-        return {"raw_text": "", "store_name": None, "receipt_date": None, "total_amount": None, "items": []}
+        return {
+            "raw_text": "", "store_name": None, "receipt_date": None,
+            "total_amount": None, "image_width": int(oriented_image.shape[1]),
+            "image_height": int(oriented_image.shape[0]), "items": [],
+        }
 
     lines = ocr_entries_to_lines(result)
     raw_text = "\n".join(line["text"] for line in lines)
@@ -926,6 +933,8 @@ def run_ocr(image_bytes: bytes) -> dict[str, Any]:
         "store_name": store_name,
         "receipt_date": try_extract_date(lines),
         "total_amount": total_amount,
+        "image_width": int(oriented_image.shape[1]),
+        "image_height": int(oriented_image.shape[0]),
         "items": items,
     }
 
