@@ -9,13 +9,13 @@ from typing import Any
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, UploadFile
-from rapidocr_onnxruntime import RapidOCR
+from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
 
 BASE_DIR = Path(__file__).resolve().parent
 CACHE_DIR = BASE_DIR / ".cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Receipt OCR Service", version="2.2.0")
+app = FastAPI(title="Receipt OCR Service", version="3.0.0")
 ocr_engine: RapidOCR | None = None
 
 IGNORE_KEYWORDS = [
@@ -44,8 +44,8 @@ IGNORE_KEYWORDS = [
     "KDV FISI",
 ]
 
-DECIMAL_AMOUNT_PATTERN = re.compile(r"\d{1,3}(?:[ .]\d{3})*(?:[.,]\d{2})")
-SIGNED_DECIMAL_AMOUNT_PATTERN = re.compile(r"(?P<sign>[-−])\s*(?P<amount>\d{1,3}(?:[ .]\d{3})*(?:[.,]\d{2}))")
+DECIMAL_AMOUNT_PATTERN = re.compile(r"(?:\d{1,3}(?:[ .,]\d{3})+|\d+)(?:[.,]\s*\d{2})(?!\d)")
+SIGNED_DECIMAL_AMOUNT_PATTERN = re.compile(r"(?P<sign>[-−])\s*(?P<amount>(?:\d{1,3}(?:[ .,]\d{3})+|\d+)(?:[.,]\s*\d{2})(?!\d))")
 LETTER_PATTERN = re.compile(r"[A-ZÇĞİÖŞÜa-zçğıöşü]")
 DATE_PATTERN = re.compile(r"(\d{2}[./-]\d{2}[./-]\d{2,4})")
 MEASUREMENT_UNITS = ("L", "LT", "ML", "GR", "G", "KG", "CL")
@@ -64,6 +64,9 @@ STORE_BLACKLIST = {
     "POS",
     "TOPLAM",
     "KDV",
+    "FATURA",
+    "E-ARSIV",
+    "BELGE",
 }
 MONTH_HINTS = {
     "OCAK",
@@ -89,7 +92,14 @@ MONTH_HINTS = {
 def get_ocr() -> RapidOCR:
     global ocr_engine
     if ocr_engine is None:
-        ocr_engine = RapidOCR()
+        ocr_engine = RapidOCR(params={
+            "Global.log_level": "warning",
+            "Det.ocr_version": OCRVersion("PP-OCRv5"),
+            "Det.model_type": ModelType("mobile"),
+            "Rec.ocr_version": OCRVersion("PP-OCRv5"),
+            "Rec.model_type": ModelType("mobile"),
+            "Rec.lang_type": LangRec("latin"),
+        })
     return ocr_engine
 
 
@@ -134,10 +144,14 @@ def parse_amount(raw: str) -> float | None:
     if not value:
         return None
 
-    if value.count(",") > 1 or value.count(".") > 1 or ("," in value and "." in value):
-        value = value.replace(".", "").replace(",", ".")
-    elif "," in value:
-        value = value.replace(",", ".")
+    separators = [index for index, char in enumerate(value) if char in ",."]
+    if separators and len(value) - separators[-1] - 1 == 2:
+        decimal_index = separators[-1]
+        integer_part = re.sub(r"[,.]", "", value[:decimal_index])
+        decimal_part = value[decimal_index + 1:]
+        value = f"{integer_part}.{decimal_part}"
+    else:
+        value = re.sub(r"[,.]", "", value)
 
     try:
         return float(value)
@@ -223,19 +237,30 @@ def has_letters(text: str) -> bool:
     return bool(LETTER_PATTERN.search(normalize_text(text)))
 
 
+def contains_keyword(text: str, keyword: str) -> bool:
+    return bool(re.search(rf"(?<![A-Z0-9]){re.escape(keyword)}(?![A-Z0-9])", text.upper()))
+
+
 def is_code_or_meta(text: str) -> bool:
     upper = normalize_text(text).upper()
+    key = product_match_key(upper)
     if not upper:
         return True
-    if any(keyword in upper for keyword in IGNORE_KEYWORDS):
+    if DATE_PATTERN.search(upper):
         return True
-    if any(keyword in upper for keyword in ["KART", "POS", "TEKPOS", "BANK", "VISA", "MASTER", "MASTERCARD"]):
+    if any(contains_keyword(upper, keyword) for keyword in IGNORE_KEYWORDS):
+        return True
+    if key == "TOP" or any(token in key for token in ("KASYER", "TOPK", "KAZANC")):
+        return True
+    if re.search(r"\b(?:KART|POS|TEKPOS|BANK|VISA|MASTER|MASTERCARD)\b", upper):
         return True
     if re.fullmatch(r"\d{6,}", upper):
         return True
     if re.match(r"^\d+\s*\(", upper):
         return True
     if "ADET X" in upper:
+        return True
+    if "TL/AD" in upper:
         return True
     return False
 
@@ -277,7 +302,7 @@ def product_candidate_score(candidate: str) -> int:
     upper = value.upper()
     if re.search(r"[*%]", upper):
         score -= 8
-    if any(keyword in upper for keyword in STORE_BLACKLIST):
+    if any(contains_keyword(upper, keyword) for keyword in STORE_BLACKLIST):
         score -= 20
     if len(value) < 3:
         score -= 20
@@ -296,7 +321,7 @@ def store_line_score(text: str) -> int:
         return -60
     if sum(ch.isdigit() for ch in value) >= max(2, len(value) // 4):
         return -50
-    if any(token in upper for token in STORE_BLACKLIST):
+    if any(contains_keyword(upper, token) for token in STORE_BLACKLIST):
         return -80
 
     score = len(re.findall(r"[A-ZÇĞİÖŞÜa-zçğıöşü]", value))
@@ -305,6 +330,8 @@ def store_line_score(text: str) -> int:
 
     if any(month in upper for month in MONTH_HINTS):
         score -= 12
+    if any(token in product_match_key(upper) for token in ("MAGAZACILIK", "MARKET", "TICARET", "SANAYI", "LTD", "ANONIM")):
+        score += 18
     if re.fullmatch(r"[A-Za-zÇĞİÖŞÜçğıöşü]+\s+\d{4}", value):
         score -= 24
     return score
@@ -314,6 +341,8 @@ def looks_like_measurement_amount(text: str, match: re.Match[str]) -> bool:
     normalized = normalize_text(text)
     right = normalized[match.end():match.end() + 3].upper()
     left = normalized[max(0, match.start() - 2):match.start()].upper()
+    if "%" in left:
+        return True
     if any(right.startswith(unit) for unit in MEASUREMENT_UNITS):
         return True
     if left.endswith("/") and right[:1] in {"G", "K", "L", "M", "C"}:
@@ -327,10 +356,16 @@ def extract_segmented_items(entry: dict[str, Any]) -> list[dict[str, Any]]:
     if len(matches) < 2:
         return []
 
+    starred_matches = [match for match in matches if "*" in match.group(0)]
+    if starred_matches:
+        matches = starred_matches
+
     items: list[dict[str, Any]] = []
     previous_end = 0
     total_length = max(len(normalized), 1)
     for match in matches:
+        if looks_like_measurement_amount(normalized, match):
+            continue
         amount = parse_amount(match.group(0).replace("*", "").strip())
         if amount is None or amount <= 0:
             previous_end = match.end()
@@ -374,30 +409,47 @@ def polygon_to_box(points: list[list[float]]) -> tuple[int, int, int, int]:
 
 
 def merge_lines(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: list[dict[str, Any]] = []
     if not entries:
-        return merged
+        return []
 
-    current = entries[0].copy()
-    for entry in entries[1:]:
-        current_bottom = current["top"] + current["height"]
-        same_row = abs(entry["top"] - current["top"]) <= 7 or abs(entry["top"] - current_bottom) <= 6
-        close_x = entry["left"] <= current["left"] + current["width"] + 20
+    rows: list[list[dict[str, Any]]] = []
+    for entry in sorted(entries, key=lambda item: (item["top"] + item["height"] / 2, item["left"])):
+        entry_center = entry["top"] + entry["height"] / 2
+        best_row: list[dict[str, Any]] | None = None
+        best_distance = float("inf")
 
-        if same_row and close_x:
-            current["text"] = normalize_text(f'{current["text"]} {entry["text"]}')
-            right = max(current["left"] + current["width"], entry["left"] + entry["width"])
-            bottom = max(current["top"] + current["height"], entry["top"] + entry["height"])
-            current["left"] = min(current["left"], entry["left"])
-            current["top"] = min(current["top"], entry["top"])
-            current["width"] = right - current["left"]
-            current["height"] = bottom - current["top"]
+        for row in rows[-3:]:
+            row_centers = sorted(item["top"] + item["height"] / 2 for item in row)
+            row_heights = sorted(item["height"] for item in row)
+            row_center = row_centers[len(row_centers) // 2]
+            row_height = row_heights[len(row_heights) // 2]
+            center_distance = abs(entry_center - row_center)
+            tolerance = max(8, min(entry["height"], row_height) * 0.55)
+            if center_distance <= tolerance and center_distance < best_distance:
+                best_row = row
+                best_distance = center_distance
+
+        if best_row is None:
+            rows.append([entry.copy()])
         else:
-            merged.append(current)
-            current = entry.copy()
+            best_row.append(entry.copy())
 
-    merged.append(current)
-    return merged
+    merged: list[dict[str, Any]] = []
+    for row in rows:
+        row.sort(key=lambda item: item["left"])
+        left = min(item["left"] for item in row)
+        top = min(item["top"] for item in row)
+        right = max(item["left"] + item["width"] for item in row)
+        bottom = max(item["top"] + item["height"] for item in row)
+        merged.append({
+            "text": normalize_text(" ".join(item["text"] for item in row)),
+            "left": left,
+            "top": top,
+            "width": right - left,
+            "height": bottom - top,
+        })
+
+    return sorted(merged, key=lambda item: (item["top"], item["left"]))
 
 
 def split_mixed_lines(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -434,6 +486,89 @@ def split_mixed_lines(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return split_entries
 
 
+def ocr_entries_to_lines(entries: list[list[Any]]) -> list[dict[str, Any]]:
+    raw_entries: list[dict[str, Any]] = []
+    for entry in entries:
+        if len(entry) < 2:
+            continue
+        text = normalize_text(str(entry[1]))
+        if not text:
+            continue
+        left, top, width, height = polygon_to_box(entry[0])
+        raw_entries.append({
+            "text": text,
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height,
+        })
+
+    raw_entries.sort(key=lambda item: (item["top"], item["left"]))
+    return split_mixed_lines(merge_lines(raw_entries))
+
+
+def receipt_candidate_score(entries: list[list[Any]]) -> float:
+    lines = ocr_entries_to_lines(entries)
+    if not lines:
+        return 0.0
+
+    total = try_extract_total(lines)
+    items = extract_items(lines)
+    score = min(ocr_result_score(entries) / 20, 25)
+    score += 35 if try_extract_date(lines) else 0
+    score += 80 if total else 0
+    score += min(len(items), 12) * 8
+
+    if total and items:
+        item_sum = sum(float(item.get("line_total") or 0) for item in items)
+        relative_error = abs(item_sum - total) / max(total, 1)
+        if relative_error <= 0.03:
+            score += 50
+        elif relative_error <= 0.15:
+            score += 20
+    return score
+
+
+def normalize_store_candidate(text: str) -> str:
+    value = normalize_text(text)
+    address_match = re.search(
+        r"\b(?:MAH(?:ALLE)?|MH|CAD(?:DE)?|CD|SOK(?:AK)?|TEL|ADRES)\b|\bNO\s*:",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if address_match and address_match.start() >= 5:
+        value = value[:address_match.start()]
+    return normalize_text(value.strip(" -*_/"))
+
+
+def receipt_candidate_is_complete(entries: list[list[Any]]) -> bool:
+    lines = ocr_entries_to_lines(entries)
+    total = try_extract_total(lines)
+    items = extract_items(lines)
+    if not total or not items or not try_extract_date(lines):
+        return False
+    item_sum = sum(float(item.get("line_total") or 0) for item in items)
+    return abs(item_sum - total) / max(total, 1) <= 0.15
+
+
+def receipt_lines_look_upside_down(lines: list[dict[str, Any]]) -> bool:
+    if len(lines) < 8:
+        return False
+    total_indices = [
+        index for index, line in enumerate(lines)
+        if any(token in product_match_key(line["text"]) for token in ("TOPLAM", "TOPKDV", "ODENECEK"))
+    ]
+    date_indices = [index for index, line in enumerate(lines) if DATE_PATTERN.search(line["text"])]
+    if not total_indices:
+        return False
+
+    total_near_top = min(total_indices) <= len(lines) * 0.35
+    date_near_bottom = date_indices and max(date_indices) >= len(lines) * 0.55
+    top_has_store = any(store_line_score(line["text"]) >= 8 for line in lines[:8])
+    bottom_has_store = any(store_line_score(line["text"]) >= 8 for line in lines[-8:])
+    return total_near_top and (bool(date_near_bottom) or (not top_has_store and bottom_has_store))
+
+
 def try_extract_date(lines: list[dict[str, Any]]) -> str | None:
     for line in lines:
         for match in DATE_PATTERN.finditer(line["text"]):
@@ -456,21 +591,66 @@ def try_extract_date(lines: list[dict[str, Any]]) -> str | None:
 
 
 def try_extract_total(lines: list[dict[str, Any]]) -> float | None:
-    priority_words = ["ÖDENECEK", "ODENECEK", "DAHİL TUTAR", "DAHIL TUTAR", "GENEL TOPLAM", "TOPLAM", "TUTAR"]
-    for keyword in priority_words:
-        for line in reversed(lines):
-            upper = line["text"].upper()
-            if keyword not in upper:
-                continue
-            if "TOPLAM KDV" in upper:
-                continue
-            amount = amount_from_text(line["text"])
-            if amount and amount > 0:
-                return amount
+    def positive_amounts(text: str) -> list[float]:
+        return [amount for match in amount_tokens(text) if (amount := parse_amount(match.group(0))) and amount > 0]
+
+    def is_total_label(key: str) -> bool:
+        tokens = ("ODENECEK", "GENELTOPLAM", "TOPLAM", "TOPLAIM", "TOPLM", "TOPLAI")
+        return any(token in key for token in tokens) or key == "TOP"
+
+    def label_priority(index_and_line: tuple[int, dict[str, Any]]) -> int:
+        key = product_match_key(index_and_line[1]["text"])
+        if "ODENECEK" in key:
+            return 0
+        if "TOPLAMTUTAR" in key or "GENELTOPLAM" in key:
+            return 1
+        if ("TOPKDV" in key or key.startswith("KDVTOPLAM")) and len(positive_amounts(index_and_line[1]["text"])) >= 2:
+            return 2
+        if is_total_label(key) and not any(token in key for token in ("ARATOPLAM", "MALHIZMETTOPLAM")):
+            return 3
+        if is_total_label(key):
+            return 4
+        return 5
+
+    for index, line in sorted(enumerate(lines), key=label_priority):
+        key = product_match_key(line["text"])
+        if "KDVDAHILTUTAR" in key or "KDVORANI" in key or "TOPLAMISKONTO" in key:
+            continue
+
+        amounts = positive_amounts(line["text"])
+        has_total = is_total_label(key)
+        has_tax_total = "TOPKDV" in key or key.startswith("KDVTOPLAM")
+        if not has_total and not has_tax_total:
+            continue
+        if has_tax_total and not has_total and len(amounts) < 2:
+            continue
+        if has_tax_total and not has_total and len(amounts) >= 2:
+            return max(amounts)
+
+        candidates = list(amounts)
+        for nearby in lines[index + 1:index + 4]:
+            nearby_key = product_match_key(nearby["text"])
+            nearby_amounts = positive_amounts(nearby["text"])
+            is_payment = any(token in nearby_key for token in ("KREDI", "NAKIT", "BANKAKARTI", "KARTI"))
+            if (not has_letters(nearby["text"]) or is_payment) and nearby_amounts:
+                candidates.extend(nearby_amounts)
+            if is_payment:
+                break
+
+        if candidates:
+            return max(candidates)
+
     for line in reversed(lines):
-        amount = amount_from_text(line["text"])
-        if amount and amount > 0:
-            return amount
+        key = product_match_key(line["text"])
+        if not any(token in key for token in ("KREDI", "NAKIT", "BANKAKARTI", "KARTI")):
+            continue
+        amounts = positive_amounts(line["text"])
+        if amounts:
+            return max(amounts)
+
+    all_amounts = [amount for line in lines for amount in positive_amounts(line["text"])]
+    if all_amounts:
+        return max(all_amounts)
     return None
 
 
@@ -498,6 +678,9 @@ def extract_inline_item(text: str) -> tuple[str, float] | None:
             if not candidate:
                 continue
             score = product_candidate_score(candidate)
+            prefix = normalized[max(0, match.start() - 3):match.start()]
+            if "*" in prefix:
+                score += 30
             if amount > 5000:
                 score -= 50
             if score > best_score:
@@ -601,7 +784,7 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         if re.fullmatch(r"(?:\d+[.,]?\d*\s*)?(?:KGX|[I1]1/KG|X\d+|TL/KG)", upper_name):
             continue
-        if re.fullmatch(r"[A-Z0-9./-]{1,6}", upper_name):
+        if re.fullmatch(r"[0-9./-]{1,12}", upper_name):
             continue
         duplicate = next((existing for existing in deduped if (
             existing["name"].upper() == upper_name
@@ -622,32 +805,46 @@ def run_ocr(image_bytes: bytes) -> dict[str, Any]:
     if image is None:
         return {"raw_text": "", "store_name": None, "receipt_date": None, "total_amount": None, "items": []}
 
+    def to_entries(output: Any) -> list[list[Any]]:
+        boxes = output.boxes if output.boxes is not None else []
+        texts = output.txts if output.txts is not None else []
+        scores = output.scores if output.scores is not None else []
+        return [
+            [np.asarray(box).tolist(), text, float(score)]
+            for box, text, score in zip(boxes, texts, scores)
+        ]
+
+    def mostly_vertical(entries: list[list[Any]]) -> bool:
+        dimensions = [polygon_to_box(entry[0])[2:] for entry in entries]
+        if len(dimensions) < 3:
+            return False
+        vertical = sum(1 for width, height in dimensions if height > width * 1.35)
+        return vertical / len(dimensions) >= 0.60
+
     engine = get_ocr()
-    original_result, _ = engine(image)
-    enhanced_result, _ = engine(enhance_receipt_image(image))
-    result = max((original_result, enhanced_result), key=ocr_result_score)
+    original_entries = to_entries(engine(image))
+    oriented_image, result = image, original_entries
+    metadata_result = original_entries
+    if mostly_vertical(original_entries):
+        rotated_candidates = []
+        for rotation in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE):
+            rotated = cv2.rotate(image, rotation)
+            rotated_candidates.append((rotated, to_entries(engine(rotated))))
+        oriented_image, result = max(rotated_candidates, key=lambda candidate: receipt_candidate_score(candidate[1]))
+        metadata_result = result
+    elif not receipt_candidate_is_complete(original_entries):
+        enhanced_entries = to_entries(engine(enhance_receipt_image(image)))
+        if receipt_candidate_score(enhanced_entries) >= receipt_candidate_score(original_entries) + 10:
+            result = enhanced_entries
+    if receipt_lines_look_upside_down(ocr_entries_to_lines(result)):
+        oriented_image = cv2.rotate(oriented_image, cv2.ROTATE_180)
+        result = to_entries(engine(oriented_image))
+        metadata_result = result
+
     if not result:
         return {"raw_text": "", "store_name": None, "receipt_date": None, "total_amount": None, "items": []}
 
-    raw_entries: list[dict[str, Any]] = []
-    for entry in result:
-        if len(entry) < 2:
-            continue
-        points = entry[0]
-        text = normalize_text(entry[1])
-        if not text:
-            continue
-        left, top, width, height = polygon_to_box(points)
-        raw_entries.append({
-            "text": text,
-            "left": left,
-            "top": top,
-            "width": width,
-            "height": height,
-        })
-
-    raw_entries.sort(key=lambda item: (item["top"], item["left"]))
-    lines = split_mixed_lines(merge_lines(raw_entries))
+    lines = ocr_entries_to_lines(result)
     raw_text = "\n".join(line["text"] for line in lines)
     items = extract_items(lines)
     total_amount = try_extract_total(lines)
@@ -658,17 +855,17 @@ def run_ocr(image_bytes: bytes) -> dict[str, Any]:
             "price": total_amount,
             "quantity": 1,
             "line_total": total_amount,
-            "box_left": max(image.shape[1] - 140, 10),
-            "box_top": max(image.shape[0] - 64, 10),
+            "box_left": max(oriented_image.shape[1] - 140, 10),
+            "box_top": max(oriented_image.shape[0] - 64, 10),
             "box_width": 120,
             "box_height": 32,
         }]
 
-    max_store_top = max(80, int(image.shape[0] * 0.22))
+    metadata_lines = ocr_entries_to_lines(metadata_result)
     store_candidates = [
-        line["text"]
-        for line in lines[:8]
-        if line["top"] <= max_store_top and store_line_score(line["text"]) >= 8
+        normalize_store_candidate(line["text"])
+        for line in metadata_lines[:8]
+        if store_line_score(normalize_store_candidate(line["text"])) >= 8
     ]
     store_name = store_candidates[0] if store_candidates else None
 
