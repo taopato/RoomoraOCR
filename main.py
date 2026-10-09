@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CACHE_DIR = BASE_DIR / ".cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Receipt OCR Service", version="2.1.0")
+app = FastAPI(title="Receipt OCR Service", version="2.2.0")
 ocr_engine: RapidOCR | None = None
 
 IGNORE_KEYWORDS = [
@@ -44,6 +45,7 @@ IGNORE_KEYWORDS = [
 ]
 
 DECIMAL_AMOUNT_PATTERN = re.compile(r"\d{1,3}(?:[ .]\d{3})*(?:[.,]\d{2})")
+SIGNED_DECIMAL_AMOUNT_PATTERN = re.compile(r"(?P<sign>[-−])\s*(?P<amount>\d{1,3}(?:[ .]\d{3})*(?:[.,]\d{2}))")
 LETTER_PATTERN = re.compile(r"[A-ZÇĞİÖŞÜa-zçğıöşü]")
 DATE_PATTERN = re.compile(r"(\d{2}[./-]\d{2}[./-]\d{2,4})")
 MEASUREMENT_UNITS = ("L", "LT", "ML", "GR", "G", "KG", "CL")
@@ -91,6 +93,32 @@ def get_ocr() -> RapidOCR:
     return ocr_engine
 
 
+def enhance_receipt_image(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    contrasted = clahe.apply(gray)
+    blurred = cv2.GaussianBlur(contrasted, (0, 0), 1.1)
+    sharpened = cv2.addWeighted(contrasted, 1.55, blurred, -0.55, 0)
+    return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+
+
+def ocr_result_score(result: list[Any] | None) -> float:
+    if not result:
+        return 0.0
+
+    score = 0.0
+    for entry in result:
+        if len(entry) < 2:
+            continue
+        text = normalize_text(str(entry[1]))
+        confidence = float(entry[2]) if len(entry) > 2 else 0.5
+        score += len(text) * max(confidence, 0.05)
+        upper = text.upper()
+        if any(keyword in upper for keyword in ("TOPLAM", "TUTAR", "İNDİRİM", "INDIRIM", "TARİH", "TARIH")):
+            score += 10
+    return score
+
+
 def normalize_text(value: str) -> str:
     cleaned = (
         (value or "")
@@ -115,6 +143,60 @@ def parse_amount(raw: str) -> float | None:
         return float(value)
     except ValueError:
         return None
+
+
+def product_match_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", normalize_product_candidate(value).upper())
+    return re.sub(r"[^A-Z0-9]", "", normalized.encode("ascii", "ignore").decode("ascii"))
+
+
+def extract_discount(text: str, assume_discount: bool = False) -> tuple[str, float] | None:
+    normalized = normalize_text(text)
+    matches = list(SIGNED_DECIMAL_AMOUNT_PATTERN.finditer(normalized))
+    if matches:
+        match = matches[-1]
+        amount = parse_amount(match.group("amount"))
+    elif assume_discount:
+        amount_matches = amount_tokens(normalized)
+        if not amount_matches:
+            return None
+        match = amount_matches[-1]
+        amount = parse_amount(match.group(0))
+    else:
+        return None
+
+    name = normalize_product_candidate(normalized[:match.start()])
+    if amount is None or amount <= 0 or product_candidate_score(name) < 4:
+        return None
+    return name, amount
+
+
+def apply_discounts(items: list[dict[str, Any]], discounts: list[tuple[str, float]]) -> None:
+    for discount_name, discount_amount in discounts:
+        discount_key = product_match_key(discount_name)
+        if not discount_key:
+            continue
+
+        candidates = [
+            item for item in items
+            if product_match_key(item["name"]) == discount_key
+            or product_match_key(item["name"]) in discount_key
+            or discount_key in product_match_key(item["name"])
+        ]
+        if not candidates:
+            continue
+
+        # Repeated campaign rows on Turkish receipts generally belong to the
+        # same printed product row. Keep accumulating them on that row.
+        item = max(candidates, key=lambda candidate: float(candidate.get("line_total") or 0))
+        original_total = float(item.get("original_line_total") or item.get("line_total") or 0)
+        applied = float(item.get("discount_amount") or 0) + discount_amount
+        net_total = max(0.0, round(original_total - applied, 2))
+        item["original_line_total"] = original_total
+        item["discount_amount"] = round(applied, 2)
+        item["line_total"] = net_total
+        if float(item.get("quantity") or 1) == 1:
+            item["price"] = net_total
 
 
 def amount_tokens(text: str) -> list[re.Match[str]]:
@@ -374,7 +456,7 @@ def try_extract_date(lines: list[dict[str, Any]]) -> str | None:
 
 
 def try_extract_total(lines: list[dict[str, Any]]) -> float | None:
-    priority_words = ["ODENECEK", "DAHIL TUTAR", "GENEL TOPLAM", "TOPLAM", "TUTAR"]
+    priority_words = ["ÖDENECEK", "ODENECEK", "DAHİL TUTAR", "DAHIL TUTAR", "GENEL TOPLAM", "TOPLAM", "TUTAR"]
     for keyword in priority_words:
         for line in reversed(lines):
             upper = line["text"].upper()
@@ -427,11 +509,39 @@ def extract_inline_item(text: str) -> tuple[str, float] | None:
 
 def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
+    discounts: list[tuple[str, float]] = []
+    in_discount_section = False
     index = 0
 
     while index < len(lines):
         current = lines[index]
         text = current["text"]
+        upper = text.upper()
+
+        if "INDIRIMLER" in product_match_key(upper) or "INDIRIMLERI" in product_match_key(upper):
+            in_discount_section = True
+            index += 1
+            continue
+
+        if in_discount_section and any(keyword in upper for keyword in ("MAL/HIZMET", "MAL HIZMET", "ÖDENECEK", "ODENECEK", "TOPKDV", "TOPLAM KDV")):
+            in_discount_section = False
+
+        discount = extract_discount(text, in_discount_section)
+        if discount:
+            discounts.append(discount)
+            index += 1
+            continue
+
+        if in_discount_section and is_product_name(text) and index + 1 < len(lines):
+            next_discount = extract_discount(f"{text} {lines[index + 1]['text']}", True)
+            if next_discount:
+                discounts.append(next_discount)
+                index += 2
+                continue
+
+        if in_discount_section:
+            index += 1
+            continue
 
         segmented_items = extract_segmented_items(current)
         if segmented_items:
@@ -482,7 +592,6 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
         index += 1
 
     deduped: list[dict[str, Any]] = []
-    seen: set[tuple[str, float]] = set()
     for item in items:
         item["name"] = normalize_product_candidate(item["name"])
         upper_name = item["name"].upper()
@@ -494,12 +603,16 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         if re.fullmatch(r"[A-Z0-9./-]{1,6}", upper_name):
             continue
-        key = (upper_name, float(item["line_total"]))
-        if key in seen:
+        duplicate = next((existing for existing in deduped if (
+            existing["name"].upper() == upper_name
+            and float(existing["line_total"]) == float(item["line_total"])
+            and abs(int(existing.get("box_top") or 0) - int(item.get("box_top") or 0)) <= 8
+        )), None)
+        if duplicate:
             continue
-        seen.add(key)
         deduped.append(item)
 
+    apply_discounts(deduped, discounts)
     return deduped[:40]
 
 
@@ -510,7 +623,9 @@ def run_ocr(image_bytes: bytes) -> dict[str, Any]:
         return {"raw_text": "", "store_name": None, "receipt_date": None, "total_amount": None, "items": []}
 
     engine = get_ocr()
-    result, _ = engine(image)
+    original_result, _ = engine(image)
+    enhanced_result, _ = engine(enhance_receipt_image(image))
+    result = max((original_result, enhanced_result), key=ocr_result_score)
     if not result:
         return {"raw_text": "", "store_name": None, "receipt_date": None, "total_amount": None, "items": []}
 

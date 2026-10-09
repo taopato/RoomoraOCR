@@ -26,3 +26,6 @@ jobs:
 
       - name: Smoke import
         run: python -c "import main; print(main.app.title)"
+
+      - name: Parser tests
+        run: python -m unittest discover -s tests -v
