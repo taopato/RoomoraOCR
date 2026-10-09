@@ -13,6 +13,10 @@ RUN pip install --no-cache-dir --requirement requirements.txt
 
 COPY main.py .
 
+# Resolve and validate the selected model while the image still runs as root.
+# Runtime containers are intentionally unprivileged and cannot write here.
+RUN python -c "import main; main.get_ocr()"
+
 RUN useradd --create-home --uid 10001 roomora
 RUN mkdir -p /app/.cache && chown -R roomora:roomora /app/.cache
 USER roomora

@@ -8,7 +8,7 @@ from typing import Any
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -880,7 +880,11 @@ def run_ocr(image_bytes: bytes) -> dict[str, Any]:
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    try:
+        get_ocr()
+    except Exception as error:
+        raise HTTPException(status_code=503, detail="OCR engine is not ready") from error
+    return {"status": "ok", "ocr": "ready"}
 
 
 @app.post("/scan")
