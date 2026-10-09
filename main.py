@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from difflib import SequenceMatcher
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -198,6 +199,20 @@ def apply_discounts(items: list[dict[str, Any]], discounts: list[tuple[str, floa
             or discount_key in product_match_key(item["name"])
         ]
         if not candidates:
+            ranked = sorted(
+                (
+                    (SequenceMatcher(None, product_match_key(item["name"]), discount_key).ratio(), item)
+                    for item in items
+                    if product_match_key(item["name"])
+                ),
+                key=lambda candidate: candidate[0],
+                reverse=True,
+            )
+            best_score = ranked[0][0] if ranked else 0.0
+            runner_up_score = ranked[1][0] if len(ranked) > 1 else 0.0
+            if best_score >= 0.78 and best_score - runner_up_score >= 0.08:
+                candidates = [ranked[0][1]]
+        if not candidates:
             continue
 
         # Repeated campaign rows on Turkish receipts generally belong to the
@@ -362,7 +377,6 @@ def extract_segmented_items(entry: dict[str, Any]) -> list[dict[str, Any]]:
 
     items: list[dict[str, Any]] = []
     previous_end = 0
-    total_length = max(len(normalized), 1)
     for match in matches:
         if looks_like_measurement_amount(normalized, match):
             continue
@@ -372,27 +386,22 @@ def extract_segmented_items(entry: dict[str, Any]) -> list[dict[str, Any]]:
             continue
 
         candidate = normalize_product_candidate(normalized[previous_end:match.start()])
-        segment_start = previous_end
-        segment_end = match.end()
         previous_end = match.end()
 
         if product_candidate_score(candidate) < 4:
             continue
 
-        left_ratio = max(0.0, min(1.0, segment_start / total_length))
-        right_ratio = max(left_ratio, min(1.0, segment_end / total_length))
-        segment_left = int(entry["left"] + (entry["width"] * left_ratio))
-        segment_width = int(max(44, (entry["width"] * (right_ratio - left_ratio))))
+        amount_box = amount_box_for_entry(entry, amount, match)
 
         items.append({
             "name": candidate,
             "price": amount,
             "quantity": 1,
             "line_total": amount,
-            "box_left": segment_left,
-            "box_top": entry["top"],
-            "box_width": segment_width,
-            "box_height": max(entry["height"], 24),
+            "box_left": amount_box["left"],
+            "box_top": amount_box["top"],
+            "box_width": amount_box["width"],
+            "box_height": amount_box["height"],
         })
 
     return items
@@ -447,6 +456,7 @@ def merge_lines(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "top": top,
             "width": right - left,
             "height": bottom - top,
+            "segments": [item.copy() for item in row],
         })
 
     return sorted(merged, key=lambda item: (item["top"], item["left"]))
@@ -690,6 +700,47 @@ def extract_inline_item(text: str) -> tuple[str, float] | None:
     return best_item if best_score >= 4 else None
 
 
+def amount_box_for_entry(
+    entry: dict[str, Any],
+    amount: float,
+    preferred_match: re.Match[str] | None = None,
+) -> dict[str, int]:
+    for segment in reversed(entry.get("segments") or []):
+        for match in reversed(amount_tokens(segment["text"])):
+            parsed = parse_amount(match.group(0))
+            if parsed is not None and abs(parsed - amount) < 0.005:
+                return {
+                    "left": int(segment["left"]),
+                    "top": int(segment["top"]),
+                    "width": int(segment["width"]),
+                    "height": max(int(segment["height"]), 24),
+                }
+
+    normalized = normalize_text(entry["text"])
+    matching = [
+        match for match in amount_tokens(normalized)
+        if (parsed := parse_amount(match.group(0))) is not None and abs(parsed - amount) < 0.005
+    ]
+    match = preferred_match or (matching[-1] if matching else None)
+    if match is None:
+        return {
+            "left": int(entry["left"]),
+            "top": int(entry["top"]),
+            "width": int(entry["width"]),
+            "height": max(int(entry["height"]), 24),
+        }
+
+    total_length = max(len(normalized), 1)
+    left = int(entry["left"] + entry["width"] * (match.start() / total_length))
+    right = int(entry["left"] + entry["width"] * (match.end() / total_length))
+    return {
+        "left": left,
+        "top": int(entry["top"]),
+        "width": max(right - left, 44),
+        "height": max(int(entry["height"]), 24),
+    }
+
+
 def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     discounts: list[tuple[str, float]] = []
@@ -740,15 +791,16 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if inline_item:
             name, inline_amount = inline_item
             if name and not is_code_or_meta(name):
+                amount_box = amount_box_for_entry(current, inline_amount)
                 items.append({
                     "name": name,
                     "price": inline_amount,
                     "quantity": 1,
                     "line_total": inline_amount,
-                    "box_left": current["left"],
-                    "box_top": current["top"],
-                    "box_width": current["width"],
-                    "box_height": current["height"],
+                    "box_left": amount_box["left"],
+                    "box_top": amount_box["top"],
+                    "box_width": amount_box["width"],
+                    "box_height": amount_box["height"],
                 })
                 index += 1
                 continue

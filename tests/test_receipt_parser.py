@@ -37,7 +37,11 @@ class ReceiptParserTests(unittest.TestCase):
         lines = merge_lines(entries)
 
         self.assertEqual(["OTOPARK %20 *70,00", "KDV *11,67"], [line["text"] for line in lines])
-        self.assertEqual(70.0, extract_items(lines)[0]["line_total"])
+        item = extract_items(lines)[0]
+        self.assertEqual(70.0, item["line_total"])
+        self.assertEqual((720, 196, 120, 34), (
+            item["box_left"], item["box_top"], item["box_width"], item["box_height"]
+        ))
 
     def test_accepts_ocr_space_after_decimal_separator(self):
         items = extract_items(receipt_lines("CANTA %8 *350, 00"))
@@ -182,6 +186,21 @@ SUTAS TAM YAGLI SUT 1L *9,50
 
         self.assertEqual(40.0, items[0]["line_total"])
         self.assertEqual(9.5, items[0]["discount_amount"])
+
+    def test_fuzzy_matches_a_discount_name_corrupted_differently_by_ocr(self):
+        lines = receipt_lines(
+            """
+SLEEPYY\ufffdZTEM10OL\ufffd %20.0 *119,00
+URUN INDIRIMLERI:
+SLEEPYYUZTEM1OOL\ufffd %20.0 *-41,50
+ODENECEK TUTAR *77,50
+"""
+        )
+
+        items = extract_items(lines)
+
+        self.assertEqual(77.5, items[0]["line_total"])
+        self.assertEqual(41.5, items[0]["discount_amount"])
 
     def test_keeps_same_product_on_different_receipt_rows(self):
         lines = receipt_lines(
