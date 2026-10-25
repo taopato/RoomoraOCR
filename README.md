@@ -1,5 +1,20 @@
 # Roomora OCR Service
 
+Roomora'nin self-hosted fis okuma servisi. Turkce market fislerinde urunleri, tekrar eden indirim satirlarini ve odenecek tutari ayiklar; ucuncu taraf OCR'a gorsel gondermez.
+
+```mermaid
+flowchart LR
+    Mobile[Telefon kamerasi / galeri] --> API[Roomora Backend]
+    API --> Service[FastAPI / Roomora OCR]
+    Service --> Image[Goruntu duzeltme]
+    Image --> Model[RapidOCR]
+    Model --> Parse[Satir, fiyat ve indirim esleme]
+    Parse --> API
+    API --> Review[Kullanici onayi ve kalem paylasimi]
+```
+
+OCR sonucu kullanici onayindan once kesin muhasebe kaydi sayilmaz. Fiyat ve indirim eslestirmesi hataliysa mobil ekranda duzeltilebilir.
+
 ## Docker
 
 ```bash
