@@ -1,6 +1,7 @@
 import unittest
 
 from main import (
+    discard_implausible_items,
     extract_items,
     merge_lines,
     normalize_store_candidate,
@@ -253,6 +254,46 @@ TOPKDV TOPLAM *481,90 *3,48"""
         self.assertEqual(481.9, try_extract_total(lines))
         self.assertFalse(any("PRINGLES" in item["name"] for item in items))
         self.assertEqual(2, sum("DORITOS" in item["name"] for item in items))
+
+    def test_payment_terminal_lines_are_not_products(self):
+        lines = receipt_lines(
+            """CANTA %8 *350,00
+TOPLAM *350,00
+DENIZBANK *350,00
+ISLEM TUTARI 350,00 TL
+TOPLM 350,00"""
+        )
+        self.assertEqual(["CANTA"], [item["name"] for item in extract_items(lines)])
+
+    def test_bank_tax_and_unit_price_lines_are_not_products(self):
+        lines = receipt_lines(
+            """ULKER CIKOLATA *183,03
+TL./KG *199,00
+KDU *20,59
+YAPIKREDI *183,03
+Finansbank Pesin (1) KREDt KARTI *183,03
+alt ECore Cashless *183,03"""
+        )
+        self.assertEqual(["ULKER CIKOLATA"], [item["name"] for item in extract_items(lines)])
+
+    def test_cancelled_product_is_removed(self):
+        lines = receipt_lines(
+            """OKYANUS KOSELIK *185,00
+** IPTAL **
+OKYANUS KOSELIK *-185,00
+HAVLULUK *99,00
+TOPLAM *99,00"""
+        )
+        self.assertEqual(["HAVLULUK"], [item["name"] for item in extract_items(lines)])
+
+    def test_invoice_quantity_columns_are_not_products(self):
+        lines = receipt_lines("1 Ad 88380,01\n1 Ade 759,99\nTOPLAM TUTAR 381,98 TL")
+        self.assertEqual([], extract_items(lines))
+
+    def test_implausible_invoice_amount_requires_manual_review(self):
+        items = [{"name": "ODA KOKUSU", "line_total": 88380.01}]
+        self.assertEqual([], discard_implausible_items(items, 381.98))
+        self.assertEqual(items, discard_implausible_items(items, 90000))
 
 
 if __name__ == "__main__":

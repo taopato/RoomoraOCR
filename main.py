@@ -265,13 +265,17 @@ def is_code_or_meta(text: str) -> bool:
         return True
     if any(contains_keyword(upper, keyword) for keyword in IGNORE_KEYWORDS):
         return True
-    if key == "TOP" or key.startswith("ARATOP") or any(token in key for token in ("KASYER", "TOPK", "KAZANC")):
+    if key in {"TOP", "KDU", "TLKG"} or key.startswith(("ARATOP", "TOPLM", "TOPLAI", "KREDIKART")) or any(token in key for token in ("KASYER", "TOPK", "KAZANC", "ISLEMTUTAR", "ILEMTUTAR", "CASHLESS")):
+        return True
+    if key.endswith(("BANK", "BANKASI", "KREDI")) or key.startswith("BANKA") or "KREDTKART" in key:
         return True
     if re.search(r"\b(?:KART|POS|TEKPOS|BANK|VISA|MASTERCARD)\b", upper):
         return True
     if re.fullmatch(r"\d{6,}", upper):
         return True
     if re.match(r"^\d+\s*\(", upper):
+        return True
+    if re.match(r"^\d+\s*AD(?:E|ET)?(?:\b|\d|%)", upper):
         return True
     if "ADET X" in upper:
         return True
@@ -756,7 +760,7 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
         upper = text.upper()
         key = product_match_key(upper)
 
-        if "HATADUZELT" in key or "HATADUZEL" in key:
+        if "HATADUZELT" in key or "HATADUZEL" in key or key == "IPTAL":
             correction_pending = True
             index += 1
             continue
@@ -891,6 +895,12 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return deduped[:40]
 
 
+def discard_implausible_items(items: list[dict[str, Any]], total_amount: float | None) -> list[dict[str, Any]]:
+    if total_amount and any(float(item["line_total"]) > total_amount * 2 for item in items):
+        return []
+    return items
+
+
 def run_ocr(image_bytes: bytes) -> dict[str, Any]:
     image_array = np.frombuffer(image_bytes, dtype=np.uint8)
     image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
@@ -947,6 +957,8 @@ def run_ocr(image_bytes: bytes) -> dict[str, Any]:
     raw_text = "\n".join(line["text"] for line in lines)
     items = extract_items(lines)
     total_amount = try_extract_total(lines)
+
+    items = discard_implausible_items(items, total_amount)
 
     if not items and total_amount and total_amount > 0:
         items = [{
