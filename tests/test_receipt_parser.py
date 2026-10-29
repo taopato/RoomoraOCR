@@ -214,6 +214,46 @@ KINDER JOY YUM. %1.0 *43,00
 
         self.assertEqual(2, len(items))
 
+    def test_a101_subtotal_is_not_a_product(self):
+        lines = receipt_lines(
+            """ALISVERIS POSETI %20 *1,00
+AKIM KORUMALI 3 PRIZ %20 *299,00
+K. PILIC BONFILE %01 *153,44
+PIR PIL YERL 1KG OVA %01 *57,50
+PIZZAKING600GSF %01 *199,00
+BALIK6X75GDARDAN %01 *645,00
+SLEEPYYUZTEM100LU %20 *119,00
+ARA TOP. *1.473,94
+URUN INDIRIMLERI:
+SLEEPYYUZTEM100LU *41,50-D
+BALIK6X75GDARDAN *320,00-D
+TOPLAM *1112,44"""
+        )
+        items = extract_items(lines)
+        self.assertEqual(1112.44, round(sum(item["line_total"] for item in items), 2))
+        self.assertFalse(any("ARA TOP" in item["name"] for item in items))
+
+    def test_migros_correction_and_general_discount(self):
+        lines = receipt_lines(
+            """DORITOS MEGA BOY DORITOS NACHO MEGA *91,45
+*91,45
+WINSTON XSENCE BLACK *130,00
+PRINGLES SOUR CREAM *149,90
+**HATA DUZELT**
+PRINGLES SOUR CREAM x-149,90
+UNTAD LAVAS 8LI *139,50
+MASTER POTATO SOG *125,00
+INDIRIM *-35,50
+INDIRIMLER:
+UNTAD LAVAS 8LI *-60,00
+TOPKDV TOPLAM *481,90 *3,48"""
+        )
+        items = extract_items(lines)
+        self.assertEqual(481.9, round(sum(item["line_total"] for item in items), 2))
+        self.assertEqual(481.9, try_extract_total(lines))
+        self.assertFalse(any("PRINGLES" in item["name"] for item in items))
+        self.assertEqual(2, sum("DORITOS" in item["name"] for item in items))
+
 
 if __name__ == "__main__":
     unittest.main()

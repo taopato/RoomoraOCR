@@ -265,9 +265,9 @@ def is_code_or_meta(text: str) -> bool:
         return True
     if any(contains_keyword(upper, keyword) for keyword in IGNORE_KEYWORDS):
         return True
-    if key == "TOP" or any(token in key for token in ("KASYER", "TOPK", "KAZANC")):
+    if key == "TOP" or key.startswith("ARATOP") or any(token in key for token in ("KASYER", "TOPK", "KAZANC")):
         return True
-    if re.search(r"\b(?:KART|POS|TEKPOS|BANK|VISA|MASTER|MASTERCARD)\b", upper):
+    if re.search(r"\b(?:KART|POS|TEKPOS|BANK|VISA|MASTERCARD)\b", upper):
         return True
     if re.fullmatch(r"\d{6,}", upper):
         return True
@@ -536,6 +536,8 @@ def receipt_candidate_score(entries: list[list[Any]]) -> float:
             score += 50
         elif relative_error <= 0.15:
             score += 20
+        elif item_sum > total * 2:
+            score -= 60
     return score
 
 
@@ -624,7 +626,7 @@ def try_extract_total(lines: list[dict[str, Any]]) -> float | None:
 
     for index, line in sorted(enumerate(lines), key=label_priority):
         key = product_match_key(line["text"])
-        if "KDVDAHILTUTAR" in key or "KDVORANI" in key or "TOPLAMISKONTO" in key:
+        if "KDVDAHILTUTAR" in key or "KDVORANI" in key or "TOPLAMISKONTO" in key or key.startswith("ARATOP"):
             continue
 
         amounts = positive_amounts(line["text"])
@@ -745,12 +747,19 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     discounts: list[tuple[str, float]] = []
     in_discount_section = False
+    correction_pending = False
     index = 0
 
     while index < len(lines):
         current = lines[index]
         text = current["text"]
         upper = text.upper()
+        key = product_match_key(upper)
+
+        if "HATADUZELT" in key or "HATADUZEL" in key:
+            correction_pending = True
+            index += 1
+            continue
 
         if "INDIRIMLER" in product_match_key(upper) or "INDIRIMLERI" in product_match_key(upper):
             in_discount_section = True
@@ -762,7 +771,21 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         discount = extract_discount(text, in_discount_section)
         if discount:
-            discounts.append(discount)
+            if correction_pending:
+                correction_name, correction_amount = discount
+                correction_key = product_match_key(correction_name)
+                for previous in reversed(items):
+                    previous_key = product_match_key(previous["name"])
+                    if previous_key and (previous_key in correction_key or correction_key in previous_key) and abs(previous["line_total"] - correction_amount) < 0.02:
+                        items.remove(previous)
+                        break
+                correction_pending = False
+            elif key.startswith("INDIRIM") and not in_discount_section:
+                # Unnamed campaign discounts apply to the preceding purchase row.
+                if items:
+                    discounts.append((items[-1]["name"], discount[1]))
+            else:
+                discounts.append(discount)
             index += 1
             continue
 
@@ -776,6 +799,8 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if in_discount_section:
             index += 1
             continue
+
+        correction_pending = False
 
         segmented_items = extract_segmented_items(current)
         if segmented_items:
@@ -791,6 +816,21 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if inline_item:
             name, inline_amount = inline_item
             if name and not is_code_or_meta(name):
+                next_amount = amount_only(lines[index + 1]["text"]) if index + 1 < len(lines) else None
+                first_word = name.split()[0] if name.split() else ""
+                repeated_name = re.search(rf"\b{re.escape(first_word)}\b", name[len(first_word):], re.IGNORECASE) if len(first_word) >= 4 else None
+                if repeated_name and next_amount and abs(next_amount - inline_amount) < 0.02:
+                    split_at = len(first_word) + repeated_name.start()
+                    first_name, second_name = name[:split_at].strip(), name[split_at:].strip()
+                    if product_candidate_score(first_name) >= 4 and product_candidate_score(second_name) >= 4:
+                        for candidate, source in ((first_name, current), (second_name, lines[index + 1])):
+                            amount_box = amount_box_for_entry(source, inline_amount)
+                            items.append({"name": candidate, "price": inline_amount, "quantity": 1,
+                                          "line_total": inline_amount, "box_left": amount_box["left"],
+                                          "box_top": amount_box["top"], "box_width": amount_box["width"],
+                                          "box_height": amount_box["height"]})
+                        index += 2
+                        continue
                 amount_box = amount_box_for_entry(current, inline_amount)
                 items.append({
                     "name": name,
