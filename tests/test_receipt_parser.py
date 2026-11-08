@@ -1,13 +1,16 @@
 import unittest
+import numpy as np
 
 from main import (
     discard_implausible_items,
     extract_items,
     merge_lines,
     normalize_store_candidate,
+    normalize_product_candidate,
     ocr_result_score,
     parse_amount,
     receipt_lines_look_upside_down,
+    recover_missing_priced_items,
     store_line_score,
     try_extract_total,
 )
@@ -27,6 +30,95 @@ def receipt_lines(text: str):
 
 
 class ReceiptParserTests(unittest.TestCase):
+    def test_does_not_recover_existing_discounted_product_as_new_item(self):
+        image = np.zeros((1000, 1500, 3), dtype=np.uint8)
+        lines = [{"text": "SLEEPY %20 *119,00", "left": 700, "top": 500,
+                  "width": 500, "height": 30}]
+        existing = [{"name": "SLEEPY", "line_total": 77.5, "box_top": 500}]
+        calls = []
+
+        result = recover_missing_priced_items(image, lambda crop: calls.append(crop) or [],
+                                              lambda value: value, lines, existing, 196.5)
+
+        self.assertEqual(existing, result)
+        self.assertEqual([], calls)
+
+    def test_recovers_faint_product_name_from_short_crop(self):
+        image = np.zeros((1000, 1500, 3), dtype=np.uint8)
+        lines = [{"text": "8695855505897 %20 *125,00", "left": 760, "top": 500,
+                  "width": 550, "height": 30}]
+        existing = [{"name": "SOFIA", "line_total": 250.0, "box_top": 560}]
+        cropped_ocr = [
+            [[[760, 100], [1050, 100], [1050, 130], [760, 130]], "ONLY EVO 12'LI KAG", 0.99],
+            [[[1220, 100], [1320, 100], [1320, 130], [1220, 130]], "*125,00", 0.99],
+        ]
+
+        result = recover_missing_priced_items(image, lambda _: cropped_ocr, lambda value: value,
+                                              lines, existing, 375.0)
+
+        self.assertEqual(2, len(result))
+        self.assertEqual("ONLY EVO 12'LI KAG", result[0]["name"])
+        self.assertEqual(500, result[0]["box_top"])
+
+    def test_removes_barcodes_embedded_in_product_name(self):
+        self.assertEqual("ONLY EVO 12'LI KAG", normalize_product_candidate("ONLY EVO 12'LI KAG 8695855505897"))
+
+    def test_hanci_market_items_match_printed_total_without_tax_rows(self):
+        lines = receipt_lines("""
+OZHANCI MARKET ISL.BAK.SAN.TIC.LTD.STI
+TARIH : 07.11.2026 SAAT : 18:48
+0,414 KGx 39,95
+KURU SOGAN %01 *16,54
+0,692 KGx 174,95
+SALKIM DOMATES %01 *121,07
+0,776 KGx 39,95
+KURU SOGAN %01 *31,00
+ONLY EVO 12'LI KAG. %20 *125,00
+SOFIA 32'LI TUVALET %20 *250,00
+CALVE TATLI KECAP %01 *185,00
+THORLIGHT 20 LED BEY %20 *110,00
+ROLL-UP 8M SILIKONLU %20 *65,00
+ROLL-UP 8M SILIKONLU %20 *65,00
+FUJIKA 40 W LED AMPU %20 *150,00
+BILLUR TUZ IYOTLU TU %01 *30,00
+ARKO TIRAS KOP. 200 %20 *115,00
+ZAMBAK 6'LI PLASTIK %20 *75,00
+ZAMBAK 6'LI PLASTIK %20 *75,00
+FLOREX 10'LU COP T. %20 *45,00
+FLOREX 10'LU COP T. %20 *45,00
+FLOREX 10'LU COP T. %20 *45,00
+22010UB0443AD OLCU C %20 *150,00
+MASTERINI 200 ML BIT %01 *25,00
+MASTERINI 200 ML BIT %01 *25,00
+KOSKA 400 GR PRATIK %01 *120,00
+0,445 KGx 225,00
+BAGCI BIBERLI ZEYT. %01 *100,13
+THORLIGHT 12 LED BEY %20 *50,00
+ERK YUMURTA 15'LI %01 *75,00
+SIGNAL 75 ML DIS M. %10 *25,00
+ECE 70'LI BUYUK BUZD %20 *30,00
+BILLUR TUZ 750 GR %01 *25,00
+KNORR 60 GR KARABIBE %01 *90,00
+PINAR SERVIS SOSIS H %01 *195,00
+SIGNAL 1+1 DIS F. PE %10 *160,00
+ATC PIL 4'LU INCE PI %20 *45,00
+ATC PIL 4'LU INCE PI %20 *45,00
+TOPKDV *274,60
+TOPLAM *2708,74
+BANKA KREDI KARTI *2708,74
+KDV KDV TUTARI KDV'LI TOPLAM
+%01 *10,28 *1038,74
+%10 *16,82 *185,00
+%20 *247,50 *1485,00
+""")
+
+        items = extract_items(lines)
+
+        self.assertEqual(32, len(items))
+        self.assertEqual(2708.74, round(sum(item["line_total"] for item in items), 2))
+        self.assertEqual(3, sum("FLOREX" in item["name"].upper() for item in items))
+        self.assertEqual(2708.74, try_extract_total(lines))
+
     def test_merges_product_and_distant_price_on_same_visual_row(self):
         entries = [
             {"text": "OTOPARK %20", "left": 100, "top": 200, "width": 180, "height": 32},

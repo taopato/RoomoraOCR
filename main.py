@@ -297,6 +297,7 @@ def normalize_product_candidate(text: str) -> str:
     value = normalize_text(text)
     value = re.sub(r"^[\W_]+|[\W_]+$", "", value)
     value = re.sub(r"^\d{6,}\s*", "", value)
+    value = re.sub(r"\b\d{8,}\b", "", value)
     value = re.sub(r"\(\s*\d+\s*ADET\s*X\s*\d+[.,]\d{2}\s*\)", "", value, flags=re.IGNORECASE)
     value = re.sub(r"%\s*\d+[.,]?\d*", "", value)
     value = re.sub(r"\bADET\b", "", value, flags=re.IGNORECASE)
@@ -536,7 +537,9 @@ def receipt_candidate_score(entries: list[list[Any]]) -> float:
     if total and items:
         item_sum = sum(float(item.get("line_total") or 0) for item in items)
         relative_error = abs(item_sum - total) / max(total, 1)
-        if relative_error <= 0.03:
+        if abs(item_sum - total) <= 0.02:
+            score += 100
+        elif relative_error <= 0.03:
             score += 50
         elif relative_error <= 0.15:
             score += 20
@@ -564,7 +567,7 @@ def receipt_candidate_is_complete(entries: list[list[Any]]) -> bool:
     if not total or not items or not try_extract_date(lines):
         return False
     item_sum = sum(float(item.get("line_total") or 0) for item in items)
-    return abs(item_sum - total) / max(total, 1) <= 0.15
+    return abs(item_sum - total) <= 0.02
 
 
 def receipt_lines_look_upside_down(lines: list[dict[str, Any]]) -> bool:
@@ -901,6 +904,64 @@ def discard_implausible_items(items: list[dict[str, Any]], total_amount: float |
     return items
 
 
+def recover_missing_priced_items(
+    image: np.ndarray,
+    engine: RapidOCR,
+    to_entries: Any,
+    lines: list[dict[str, Any]],
+    items: list[dict[str, Any]],
+    total_amount: float | None,
+) -> list[dict[str, Any]]:
+    if not total_amount or abs(sum(item["line_total"] for item in items) - total_amount) <= 0.02:
+        return items
+
+    recovered = list(items)
+    attempts = 0
+    for line in lines:
+        key = product_match_key(line["text"])
+        if any(token in key for token in ("TOPLAM", "TOPKDV", "ODENECEK", "ARATOP")):
+            break
+        text = normalize_text(line["text"])
+        for match in amount_tokens(text):
+            if not any(char in text[max(0, match.start() - 3):match.start()] for char in "*#"):
+                continue
+            amount = parse_amount(match.group(0))
+            if amount is None or amount <= 0:
+                continue
+            if any(abs(item["box_top"] - line["top"]) <= 8
+                   or (abs(item["line_total"] - amount) <= 0.01
+                       and abs(item["box_top"] - line["top"]) <= 24)
+                   for item in recovered):
+                continue
+            if attempts >= 8:
+                return sorted(recovered, key=lambda item: item["box_top"])
+            attempts += 1
+
+            # A short vertical crop can recover faint product names lost in a full-page OCR pass.
+            top = max(0, line["top"] - 100)
+            bottom = min(image.shape[0], line["top"] + line["height"] + 110)
+            crop = image[top:bottom, :]
+            if crop.size == 0:
+                continue
+            crop_lines = ocr_entries_to_lines(to_entries(engine(crop)))
+            candidates = extract_items(crop_lines)
+            matches = [item for item in candidates
+                       if abs(item["line_total"] - amount) <= 0.01
+                       and abs(item["box_top"] + top - line["top"]) <= 40]
+            if not matches:
+                continue
+            candidate = min(matches, key=lambda item: abs(item["box_top"] + top - line["top"]))
+            candidate = {**candidate, "box_top": candidate["box_top"] + top}
+            old_gap = abs(total_amount - sum(item["line_total"] for item in recovered))
+            new_gap = abs(total_amount - sum(item["line_total"] for item in recovered) - amount)
+            if new_gap < old_gap:
+                recovered.append(candidate)
+                if new_gap <= 0.02:
+                    return sorted(recovered, key=lambda item: item["box_top"])
+
+    return sorted(recovered, key=lambda item: item["box_top"])
+
+
 def run_ocr(image_bytes: bytes) -> dict[str, Any]:
     image_array = np.frombuffer(image_bytes, dtype=np.uint8)
     image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
@@ -959,6 +1020,7 @@ def run_ocr(image_bytes: bytes) -> dict[str, Any]:
     total_amount = try_extract_total(lines)
 
     items = discard_implausible_items(items, total_amount)
+    items = recover_missing_priced_items(oriented_image, engine, to_entries, lines, items, total_amount)
 
     if not items and total_amount and total_amount > 0:
         items = [{
