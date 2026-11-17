@@ -224,8 +224,7 @@ def apply_discounts(items: list[dict[str, Any]], discounts: list[tuple[str, floa
         item["original_line_total"] = original_total
         item["discount_amount"] = round(applied, 2)
         item["line_total"] = net_total
-        if float(item.get("quantity") or 1) == 1:
-            item["price"] = net_total
+        item["price"] = round(net_total / float(item.get("quantity") or 1), 2)
 
 
 def amount_tokens(text: str) -> list[re.Match[str]]:
@@ -894,8 +893,41 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         deduped.append(item)
 
+    apply_quantities(deduped, lines)
     apply_discounts(deduped, discounts)
     return deduped[:40]
+
+
+def apply_quantities(items: list[dict[str, Any]], lines: list[dict[str, Any]]) -> None:
+    quantity_line = re.compile(
+        r"^\s*(?P<quantity>\d+(?:[.,]\d{1,3})?)\s*(?:AD(?:ET)?|KG|GR|G)\s*[X×]\s*"
+        r"(?P<unit>\d+(?:[.,]\d{2}))\s*$", re.IGNORECASE
+    )
+    for index, line in enumerate(lines):
+        match = quantity_line.match(normalize_text(line["text"]))
+        if not match:
+            continue
+        quantity = float(match.group("quantity").replace(",", "."))
+        unit = parse_amount(match.group("unit"))
+        if quantity <= 0 or quantity > 1000 or unit is None or unit <= 0:
+            continue
+
+        for next_line in lines[index + 1:index + 3]:
+            inline_item = extract_inline_item(next_line["text"])
+            if not inline_item:
+                continue
+            _, line_total = inline_item
+            if abs(round(quantity * unit, 2) - line_total) > 0.02:
+                break
+            candidates = [item for item in items if abs(item["line_total"] - line_total) <= 0.02]
+            if candidates:
+                item = min(candidates, key=lambda candidate: abs(
+                    int(candidate.get("box_top") or 0) - int(next_line["top"])
+                ))
+                if abs(int(item.get("box_top") or 0) - int(next_line["top"])) <= 40:
+                    item["quantity"] = quantity
+                    item["price"] = unit
+            break
 
 
 def discard_implausible_items(items: list[dict[str, Any]], total_amount: float | None) -> list[dict[str, Any]]:
