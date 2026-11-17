@@ -165,6 +165,28 @@ KDV KDV TUTARI KDV'LI TOPLAM
 
         self.assertEqual(2.0, items[0]["line_total"])
 
+    def test_quantity_rows_before_products_preserve_paid_line_totals(self):
+        lines = receipt_lines("""
+DAYCARE KULAKP.200LU %20 *54.50
+2 ad X 43.25
+1,5YAG SUT 1LHARRAS %1. *86.50
+2 ad X 1.00
+ALISVERIS POSETI %20 *2.00
+TOPLAM KDV *2.14
+Odenecek KDV Dahil Tutar *143.00
+""")
+
+        items = extract_items(lines)
+
+        self.assertEqual([1, 2, 2], [item["quantity"] for item in items])
+        self.assertEqual([54.5, 43.25, 1.0], [item["price"] for item in items])
+        self.assertEqual(143.0, sum(item["line_total"] for item in items))
+
+    def test_quantity_row_does_not_attach_when_math_disagrees(self):
+        items = extract_items(receipt_lines("2 ad X 43.25\nSUT %1 *80.00"))
+
+        self.assertEqual(1, items[0]["quantity"])
+
     def test_prefers_merchant_over_document_heading(self):
         self.assertGreater(store_line_score("A101 YENI MAGAZACILIK A.S."), store_line_score("e-Arsiv Fatura"))
 
