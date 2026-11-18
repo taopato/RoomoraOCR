@@ -3,4 +3,5 @@ uvicorn[standard]==0.35.0
 python-multipart==0.0.20
 numpy==2.2.6
 onnxruntime==1.23.2
+opencv-python==5.1.0.95
 rapidocr==3.9.2

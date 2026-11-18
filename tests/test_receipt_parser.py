@@ -1,5 +1,10 @@
+import asyncio
+import io
+import struct
 import unittest
+import zlib
 import numpy as np
+from fastapi import HTTPException, UploadFile
 
 from main import (
     discard_implausible_items,
@@ -11,6 +16,8 @@ from main import (
     parse_amount,
     receipt_lines_look_upside_down,
     recover_missing_priced_items,
+    run_ocr_checked,
+    scan,
     store_line_score,
     try_extract_total,
 )
@@ -408,6 +415,49 @@ TOPLAM *99,00"""
         items = [{"name": "ODA KOKUSU", "line_total": 88380.01}]
         self.assertEqual([], discard_implausible_items(items, 381.98))
         self.assertEqual(items, discard_implausible_items(items, 90000))
+
+    def test_cash_tendered_is_not_receipt_total(self):
+        lines = receipt_lines("EKMEK UNO *10,00\nTOPLAM *10,00\nNAKIT *50,00\nPARA USTU *40,00")
+
+        self.assertEqual(10.0, try_extract_total(lines))
+
+    def test_tax_rate_digit_is_not_thousands_group_when_star_is_missing(self):
+        lines = receipt_lines("SUTAS SUT %1 ¥100,00\nEKMEK %8 125,50\nELMA 3 150,00")
+
+        self.assertEqual([100.0, 125.5, 150.0], [item["line_total"] for item in extract_items(lines)])
+
+    def test_turkish_dotted_payment_lines_are_not_products(self):
+        lines = receipt_lines("EKMEK UNO *10,00\nTOPLAM *10,00\nNAKİT *50,00\nPARA ÜSTÜ *40,00")
+
+        self.assertEqual(["EKMEK UNO"], [item["name"] for item in extract_items(lines)])
+        self.assertEqual(10.0, try_extract_total(lines))
+
+    def test_quantity_row_does_not_overwrite_neighbouring_item(self):
+        lines = receipt_lines("2 AD X 15,00\nEKMEK *30,00\n3 AD X 10,00\nSU *30,00")
+
+        item = extract_items(lines)[0]
+        self.assertEqual((2.0, 15.0), (item["quantity"], item["price"]))
+
+
+class ScanEndpointTests(unittest.TestCase):
+    def test_empty_upload_is_bad_request(self):
+        upload = UploadFile(file=io.BytesIO(b""), filename="empty.jpg")
+
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(scan(upload))
+        self.assertEqual(400, raised.exception.status_code)
+
+    def test_oversized_image_header_is_rejected_before_decode(self):
+        def chunk(kind: bytes, data: bytes) -> bytes:
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+        # 20000x20000 piksel bildiren, gövdesi neredeyse boş PNG
+        png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 20000, 20000, 8, 0, 0, 0, 0))
+               + chunk(b"IDAT", zlib.compress(b"\x00")) + chunk(b"IEND", b""))
+
+        with self.assertRaises(HTTPException) as raised:
+            run_ocr_checked(png)
+        self.assertEqual(422, raised.exception.status_code)
 
 
 if __name__ == "__main__":

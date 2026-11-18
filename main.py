@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import os
 import re
 import unicodedata
 from difflib import SequenceMatcher
@@ -7,9 +9,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+# OpenCV bu sınırı import sırasında okur; sıkıştırma bombası PNG'leri belleği doldurmasın
+os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str(120_000_000))
+
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -37,7 +43,6 @@ IGNORE_KEYWORDS = [
     "HESAP ADI",
     "HESAP KODU",
     "BAKIYE",
-    "NÄ°HAI",
     "NIHAI",
     "ODENECEK",
     "TUTAR",
@@ -45,8 +50,8 @@ IGNORE_KEYWORDS = [
     "KDV FISI",
 ]
 
-DECIMAL_AMOUNT_PATTERN = re.compile(r"(?:\d{1,3}(?:[ .,]\d{3})+|\d+)(?:[.,]\s*\d{2})(?!\d)")
-SIGNED_DECIMAL_AMOUNT_PATTERN = re.compile(r"(?P<sign>[-−])\s*(?P<amount>(?:\d{1,3}(?:[ .,]\d{3})+|\d+)(?:[.,]\s*\d{2})(?!\d))")
+DECIMAL_AMOUNT_PATTERN = re.compile(r"(?:\d{1,3}(?:[.,]\d{3})+|\d+)(?:[.,]\s*\d{2})(?!\d)")
+SIGNED_DECIMAL_AMOUNT_PATTERN = re.compile(r"(?P<sign>[-−])\s*(?P<amount>(?:\d{1,3}(?:[.,]\d{3})+|\d+)(?:[.,]\s*\d{2})(?!\d))")
 LETTER_PATTERN = re.compile(r"[A-ZÇĞİÖŞÜa-zçğıöşü]")
 DATE_PATTERN = re.compile(r"(\d{2}[./-]\d{2}[./-]\d{2,4})")
 MEASUREMENT_UNITS = ("L", "LT", "ML", "GR", "G", "KG", "CL")
@@ -251,8 +256,13 @@ def has_letters(text: str) -> bool:
     return bool(LETTER_PATTERN.search(normalize_text(text)))
 
 
+def fold_turkish(value: str) -> str:
+    # NAKİT/NAKIT, ÜSTÜ/USTU aynı anahtar kelimeye düşsün
+    return unicodedata.normalize("NFKD", value.upper()).encode("ascii", "ignore").decode("ascii")
+
+
 def contains_keyword(text: str, keyword: str) -> bool:
-    return bool(re.search(rf"(?<![A-Z0-9]){re.escape(keyword)}(?![A-Z0-9])", text.upper()))
+    return bool(re.search(rf"(?<![A-Z0-9]){re.escape(fold_turkish(keyword))}(?![A-Z0-9])", fold_turkish(text)))
 
 
 def is_code_or_meta(text: str) -> bool:
@@ -650,7 +660,9 @@ def try_extract_total(lines: list[dict[str, Any]]) -> float | None:
             nearby_key = product_match_key(nearby["text"])
             nearby_amounts = positive_amounts(nearby["text"])
             is_payment = any(token in nearby_key for token in ("KREDI", "NAKIT", "BANKAKARTI", "KARTI"))
-            if (not has_letters(nearby["text"]) or is_payment) and nearby_amounts:
+            # Nakitte verilen para toplamdan büyük olabilir; NAKİT tutarı yalnız etiket tutarsızsa kullanılır
+            is_cash = "NAKIT" in nearby_key
+            if nearby_amounts and (not has_letters(nearby["text"]) or (is_payment and (not is_cash or not candidates))):
                 candidates.extend(nearby_amounts)
             if is_payment:
                 break
@@ -919,14 +931,16 @@ def apply_quantities(items: list[dict[str, Any]], lines: list[dict[str, Any]]) -
             _, line_total = inline_item
             if abs(round(quantity * unit, 2) - line_total) > 0.02:
                 break
-            candidates = [item for item in items if abs(item["line_total"] - line_total) <= 0.02]
+            # Yalnız aynı satırdan okunmuş ve henüz adet almamış kalemi eşle
+            candidates = [item for item in items if abs(item["line_total"] - line_total) <= 0.02
+                          and item["quantity"] == 1
+                          and abs(int(item.get("box_top") or 0) - int(next_line["top"])) <= max(8, int(next_line["height"]))]
             if candidates:
                 item = min(candidates, key=lambda candidate: abs(
                     int(candidate.get("box_top") or 0) - int(next_line["top"])
                 ))
-                if abs(int(item.get("box_top") or 0) - int(next_line["top"])) <= 40:
-                    item["quantity"] = quantity
-                    item["price"] = unit
+                item["quantity"] = quantity
+                item["price"] = unit
             break
 
 
@@ -1056,7 +1070,7 @@ def run_ocr(image_bytes: bytes) -> dict[str, Any]:
 
     if not items and total_amount and total_amount > 0:
         items = [{
-            "name": "Fis Toplami",
+            "name": "Fiş Toplamı",
             "price": total_amount,
             "quantity": 1,
             "line_total": total_amount,
@@ -1094,7 +1108,24 @@ def health() -> dict[str, str]:
     return {"status": "ok", "ocr": "ready"}
 
 
+MAX_UPLOAD_BYTES = 15_000_000
+# OCR CPU yoğun; event loop'u bloke etmesin ve bellek iki eşzamanlı işle sınırlı kalsın
+ocr_slots = asyncio.Semaphore(2)
+
+
+def run_ocr_checked(content: bytes) -> dict[str, Any]:
+    try:
+        return run_ocr(content)
+    except cv2.error as error:
+        raise HTTPException(status_code=422, detail="Görsel çözülemedi") from error
+
+
 @app.post("/scan")
 async def scan(file: UploadFile = File(...)) -> dict[str, Any]:
-    content = await file.read()
-    return run_ocr(content)
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if not content:
+        raise HTTPException(status_code=400, detail="Boş dosya")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Dosya çok büyük")
+    async with ocr_slots:
+        return await run_in_threadpool(run_ocr_checked, content)
