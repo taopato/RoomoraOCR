@@ -438,6 +438,35 @@ TOPLAM *99,00"""
         item = extract_items(lines)[0]
         self.assertEqual((2.0, 15.0), (item["quantity"], item["price"]))
 
+    def test_quantity_rows_in_common_receipt_layouts(self):
+        layouts = {
+            "price on its own line": "2 AD X 12,50\nEKMEK UNO\n*25,00",
+            "row under the product": "EKMEK UNO %1 *25,00\n2 AD X 12,50",
+            "no unit word": "2 X 12,50\nEKMEK UNO %1 *25,00",
+            "merged with the product": "2 AD X 12,50 EKMEK UNO %1 *25,00",
+            "no spaces": "2ADX12,50\nEKMEK UNO %1 *25,00",
+            "TL suffix": "2 AD X 12,50 TL\nEKMEK UNO %1 *25,00",
+            "ADT": "2 ADT X 12,50\nEKMEK UNO %1 *25,00",
+            "star after unit word": "2 AD * 12,50\nEKMEK UNO %1 *25,00",
+            "total on the row": "2 AD X 12,50 *25,00\nEKMEK UNO %1 *25,00",
+            "name, row, price": "EKMEK UNO\n2 AD X 12,50\n*25,00",
+        }
+        for name, text in layouts.items():
+            with self.subTest(name):
+                items = extract_items(receipt_lines(text))
+                self.assertEqual([("EKMEK UNO", 2.0, 12.5, 25.0)],
+                                 [(item["name"], item["quantity"], item["price"], item["line_total"]) for item in items])
+
+    def test_quantity_row_above_does_not_take_a_mismatched_total(self):
+        items = extract_items(receipt_lines("EKMEK UNO %1 *20,00\n2 AD X 12,50"))
+
+        self.assertEqual((1, 20.0), (items[0]["quantity"], items[0]["price"]))
+
+    def test_each_quantity_row_is_used_once(self):
+        items = extract_items(receipt_lines("2 AD X 12,50\nEKMEK UNO %1 *25,00\nSUT TAM YAGLI %1 *25,00"))
+
+        self.assertEqual([2.0, 1], [item["quantity"] for item in items])
+
 
 class ScanEndpointTests(unittest.TestCase):
     def test_empty_upload_is_bad_request(self):

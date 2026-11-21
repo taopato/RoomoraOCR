@@ -54,6 +54,13 @@ DECIMAL_AMOUNT_PATTERN = re.compile(r"(?:\d{1,3}(?:[.,]\d{3})+|\d+)(?:[.,]\s*\d{
 SIGNED_DECIMAL_AMOUNT_PATTERN = re.compile(r"(?P<sign>[-−])\s*(?P<amount>(?:\d{1,3}(?:[.,]\d{3})+|\d+)(?:[.,]\s*\d{2})(?!\d))")
 LETTER_PATTERN = re.compile(r"[A-ZÇĞİÖŞÜa-zçğıöşü]")
 DATE_PATTERN = re.compile(r"(\d{2}[./-]\d{2}[./-]\d{2,4})")
+# "2 AD X 12,50", "2ADX12,50", "2 ADET X 12,50 TL", "0,535 KG X 45,90", "2 X 12,50", "2 AD * 12,50"
+QUANTITY_ROW_PATTERN = re.compile(
+    r"^\s*(?P<quantity>\d{1,4}(?:[.,]\d{1,3})?)\s*"
+    r"(?P<unit_word>ADET|ADT|ADE|AD|KGR|KG|GR|G|PKT|PK|LT)?\.?\s*"
+    r"(?P<sep>[X×*])\s*(?P<unit>\d{1,6}[.,]\d{2})(?!\d)\s*(?:TL\b)?",
+    re.IGNORECASE,
+)
 MEASUREMENT_UNITS = ("L", "LT", "ML", "GR", "G", "KG", "CL")
 STORE_BLACKLIST = {
     "TARIH",
@@ -232,6 +239,36 @@ def apply_discounts(items: list[dict[str, Any]], discounts: list[tuple[str, floa
         item["price"] = round(net_total / float(item.get("quantity") or 1), 2)
 
 
+def parse_quantity_row(text: str) -> tuple[float, float, str] | None:
+    """Returns (quantity, unit price, text after the quantity part) for a quantity row."""
+    normalized = normalize_text(text)
+    match = QUANTITY_ROW_PATTERN.match(normalized)
+    if not match:
+        return None
+    # "*" also marks prices, so it counts as the multiply sign only after a unit word
+    if match.group("sep") == "*" and not match.group("unit_word"):
+        return None
+    quantity = float(match.group("quantity").replace(",", "."))
+    unit = parse_amount(match.group("unit"))
+    if quantity <= 0 or quantity > 1000 or unit is None or unit <= 0:
+        return None
+    return quantity, unit, normalized[match.end():].strip()
+
+
+def strip_quantity_prefix(entry: dict[str, Any], rest: str) -> dict[str, Any]:
+    """Line where OCR merged the quantity row and the product: keeps only the product part."""
+    normalized = normalize_text(entry["text"])
+    shift = int(entry["width"] * (len(normalized) - len(rest)) / max(len(normalized), 1))
+    left = int(entry["left"]) + shift
+    return {
+        **entry,
+        "text": rest,
+        "left": left,
+        "width": max(int(entry["width"]) - shift, 1),
+        "segments": [segment for segment in entry.get("segments") or [] if int(segment["left"]) >= left - 2],
+    }
+
+
 def amount_tokens(text: str) -> list[re.Match[str]]:
     return list(DECIMAL_AMOUNT_PATTERN.finditer(normalize_text(text)))
 
@@ -287,6 +324,9 @@ def is_code_or_meta(text: str) -> bool:
     if re.match(r"^\d+\s*AD(?:E|ET)?(?:\b|\d|%)", upper):
         return True
     if "ADET X" in upper:
+        return True
+    quantity_row = parse_quantity_row(upper)
+    if quantity_row and not has_letters(quantity_row[2]):
         return True
     if "TL/AD" in upper:
         return True
@@ -820,6 +860,11 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         correction_pending = False
 
+        quantity_row = parse_quantity_row(text)
+        if quantity_row and has_letters(quantity_row[2]):
+            current = strip_quantity_prefix(current, quantity_row[2])
+            text = current["text"]
+
         segmented_items = extract_segmented_items(current)
         if segmented_items:
             items.extend(segmented_items)
@@ -864,8 +909,13 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 continue
 
         if is_product_name(text) and index + 1 < len(lines):
-            next_line = lines[index + 1]
-            next_amount = amount_only(next_line["text"])
+            price_index = index + 1
+            quantity_row = parse_quantity_row(lines[price_index]["text"])
+            row_total = amount_only(quantity_row[2]) if quantity_row and quantity_row[2] else None
+            if quantity_row and row_total is None and price_index + 1 < len(lines):
+                price_index += 1
+            next_line = lines[price_index]
+            next_amount = row_total if row_total is not None else amount_only(next_line["text"])
             if next_amount and next_amount > 0:
                 candidate = normalize_product_candidate(text)
                 if product_candidate_score(candidate) >= 4:
@@ -879,7 +929,7 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "box_width": next_line["width"],
                         "box_height": next_line["height"],
                     })
-                    index += 2
+                    index = price_index + 1
                     continue
 
         index += 1
@@ -911,37 +961,34 @@ def extract_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def apply_quantities(items: list[dict[str, Any]], lines: list[dict[str, Any]]) -> None:
-    quantity_line = re.compile(
-        r"^\s*(?P<quantity>\d+(?:[.,]\d{1,3})?)\s*(?:AD(?:ET)?|KG|GR|G)\s*[X×]\s*"
-        r"(?P<unit>\d+(?:[.,]\d{2}))\s*$", re.IGNORECASE
-    )
-    for index, line in enumerate(lines):
-        match = quantity_line.match(normalize_text(line["text"]))
-        if not match:
+    matched: set[int] = set()
+    for line in lines:
+        quantity_row = parse_quantity_row(line["text"])
+        if not quantity_row:
             continue
-        quantity = float(match.group("quantity").replace(",", "."))
-        unit = parse_amount(match.group("unit"))
-        if quantity <= 0 or quantity > 1000 or unit is None or unit <= 0:
-            continue
+        quantity, unit, _ = quantity_row
+        expected_total = round(quantity * unit, 2)
+        top = int(line["top"])
+        height = max(int(line["height"]), 18)
 
-        for next_line in lines[index + 1:index + 3]:
-            inline_item = extract_inline_item(next_line["text"])
-            if not inline_item:
-                continue
-            _, line_total = inline_item
-            if abs(round(quantity * unit, 2) - line_total) > 0.02:
-                break
-            # Yalnız aynı satırdan okunmuş ve henüz adet almamış kalemi eşle
-            candidates = [item for item in items if abs(item["line_total"] - line_total) <= 0.02
-                          and item["quantity"] == 1
-                          and abs(int(item.get("box_top") or 0) - int(next_line["top"])) <= max(8, int(next_line["height"]))]
-            if candidates:
-                item = min(candidates, key=lambda candidate: abs(
-                    int(candidate.get("box_top") or 0) - int(next_line["top"])
-                ))
-                item["quantity"] = quantity
-                item["price"] = unit
-            break
+        def distance(item: dict[str, Any]) -> int:
+            return int(item.get("box_top") or 0) - top
+
+        # Aynı satır, altındaki üç satır ya da üstündeki iki satır; tutar adet x birim fiyat olmalı
+        candidates = [item for item in items
+                      if id(item) not in matched
+                      and item["quantity"] == 1
+                      and abs(float(item["line_total"]) - expected_total) <= 0.02
+                      and -2.5 * height <= distance(item) <= 3.5 * height]
+        if not candidates:
+            continue
+        item = min(candidates, key=lambda candidate: (
+            0 if distance(candidate) >= -height / 2 else 1,
+            abs(distance(candidate)),
+        ))
+        item["quantity"] = quantity
+        item["price"] = unit
+        matched.add(id(item))
 
 
 def discard_implausible_items(items: list[dict[str, Any]], total_amount: float | None) -> list[dict[str, Any]]:
